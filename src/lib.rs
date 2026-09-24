@@ -47,6 +47,7 @@ pub mod inode;
 pub mod inode_btree;
 pub mod log;
 pub mod log_write;
+pub mod overlay;
 pub mod super_write;
 pub mod superblock;
 pub mod truncate;
