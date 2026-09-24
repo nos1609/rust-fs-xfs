@@ -13,6 +13,12 @@ on:
   # the shared fixture builder. A release gate weaker than the branch
   # gate is worse than none, because it still reports green.
   workflow_call:
+  # Startable by hand. This repo's kernel gates run on push-to-main and on
+  # pull-requests-to-main only, and the org grants this account pull and not
+  # push — so without a manual trigger a branch that changes the write path
+  # cannot be run against a real kernel until someone else merges it, which is
+  # exactly backwards for the thing that needs proving before review.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
