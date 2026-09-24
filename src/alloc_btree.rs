@@ -91,6 +91,10 @@ pub(crate) mod offsets {
     pub const LEVEL: usize = 4;
     pub const NUMRECS: usize = 6;
     pub const BLKNO: usize = 16;
+    /// `bb_lsn`, which `struct xfs_btree_block_shdr` places immediately
+    /// after `bb_blkno`. Restamping it is what keeps a replayed block from
+    /// claiming to be older than the transaction that wrote it.
+    pub const LSN: usize = 24;
     pub const UUID: usize = 32;
     pub const OWNER: usize = 48;
     pub const CRC: usize = 52;

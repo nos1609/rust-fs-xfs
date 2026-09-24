@@ -514,6 +514,15 @@ pub mod inode_log_format {
     /// short-form directory's 30 bytes is the proof of it.
     pub const XFS_ILOG_DEXT: u32 = 0x04;
 
+    /// `XFS_ILOG_ADATA` in `ilf_fields` — the item logs the **attribute**
+    /// fork's inline contents, after the core, sized by [`offsets::ASIZE`].
+    /// The mirror of [`XFS_ILOG_DDATA`] on the other fork.
+    pub const XFS_ILOG_ADATA: u32 = 0x08;
+
+    /// `XFS_ILOG_AEXT` in `ilf_fields` — the attribute fork's extent list,
+    /// the mirror of [`XFS_ILOG_DEXT`].
+    pub const XFS_ILOG_AEXT: u32 = 0x10;
+
     /// # What the sizes mean, and how the fork operation is framed
     ///
     /// Measured on a rename inside a short-form directory — 8 operations,

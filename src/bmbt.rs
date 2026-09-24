@@ -80,6 +80,9 @@ pub(crate) mod offsets {
     /// +8 shift that puts `UUID` at 40 instead of 32: the long form
     /// carries 64-bit sibling pointers.
     pub const BLKNO: usize = 24;
+    /// `bb_lsn`, immediately after `bb_blkno` in
+    /// `struct xfs_btree_block_lhdr`, as in the short-form header.
+    pub const LSN: usize = 32;
     pub const UUID: usize = 40;
     pub const OWNER: usize = 56;
     pub const CRC: usize = 64;

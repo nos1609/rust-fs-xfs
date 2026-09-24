@@ -335,6 +335,68 @@ pub fn log_dinode_from_disk(raw: &[u8]) -> std::result::Result<Vec<u8>, &'static
     Ok(out)
 }
 
+/// Turn a logged inode core back into the on-disk bytes it came from.
+///
+/// [`log_dinode_from_disk`] applied twice, not a second table to keep in
+/// step: reversing a field's bytes a second time is the identity, so the
+/// inverse inherits the forward one's layout exactly — which matters because
+/// the two layouts move fields under `bigtime` and `nrext64`.
+///
+/// Two fields come back wrong on purpose and the caller must fix both:
+///
+/// - `di_crc` is zeroed by the writer and cannot be recovered from the core
+///   anyway, since it covers the whole inode rather than these bytes;
+/// - `di_lsn` must not be taken from the logged core at all. Upstream says so
+///   outright (`xfs_log_dinode`'s field comment: "should never be used for
+///   recovery sequencing, nor should it be recovered into the on-disk inode"),
+///   and the replayer stamps the transaction's own sequence number instead.
+///
+/// That is [`crate::apply`]'s job, which is why this returns bytes rather than
+/// writing them.
+pub fn log_dinode_to_disk(log: &[u8]) -> std::result::Result<Vec<u8>, &'static str> {
+    if log.len() < V2_LOG_DINODE_SIZE {
+        return Err("logged inode core is shorter than a v2 core");
+    }
+    let version = log[offsets::VERSION];
+    let size = match version {
+        1 | 2 => V2_LOG_DINODE_SIZE,
+        3 => LOG_DINODE_SIZE,
+        _ => return Err("unrecognised inode version"),
+    };
+    if log.len() < size {
+        return Err("logged inode core is shorter than its version's core");
+    }
+    let flags2 = if version >= 3 {
+        // Read the way the writer left it: `log_dinode_from_disk` reverses
+        // this field on a little-endian host, so on one it comes back as
+        // little-endian. On a big-endian host the two orders agree, as they
+        // did on the way out.
+        let raw: [u8; 8] = log[offsets::FLAGS2..offsets::FLAGS2 + 8]
+            .try_into()
+            .unwrap();
+        if cfg!(target_endian = "little") {
+            u64::from_le_bytes(raw)
+        } else {
+            u64::from_be_bytes(raw)
+        }
+    } else {
+        0
+    };
+    let bigtime = flags2 & DI_FLAGS2_BIGTIME != 0;
+    let nrext64 = flags2 & DI_FLAGS2_NREXT64 != 0;
+
+    let mut out = log[..size].to_vec();
+    if cfg!(target_endian = "little") {
+        for &(at, width) in field_layout(version, bigtime, nrext64) {
+            if at + width > size {
+                continue;
+            }
+            out[at..at + width].reverse();
+        }
+    }
+    Ok(out)
+}
+
 /// Offsets within the inode core, shared by the on-disk and logged forms.
 mod offsets {
     pub const VERSION: usize = 4;

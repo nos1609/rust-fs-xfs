@@ -19,15 +19,30 @@
 //! worse than not applying anything, and the caller cannot tell the two
 //! apart without a second tool.
 //!
-//! # Inode items are refused, not skipped
+//! The table below is that measurement rather than a recollection. It was
+//! taken on a real image with `tmp/ai/scripts/xfs-dir3-probe.py`, which also
+//! settled two things a scan alone gets wrong: a directory or attribute
+//! block's magic is a `u16` at offset 8, not the `u32` at 0 that every other
+//! kind leads with, and its checksum is little-endian like the rest, despite
+//! being declared `__be32` upstream.
 //!
-//! An inode item logs the same change a buffer item does but addressed
-//! through the cluster and its offset (see [`crate::log_write::InodeBuffer`]),
-//! and the logged chunk carries a stale inode image in some workloads — the
-//! module docs of [`crate::format::log_items`] record that applying it
-//! verbatim corrupts the inode. Until that case is handled deliberately,
-//! refusing names the missing piece instead of quietly leaving a block
-//! half-applied.
+//! # The sequence number is stamped, not copied
+//!
+//! Upstream's write verifier sets the metadata's `lsn` from the log item and
+//! only then recomputes the checksum, and neither field is written to the log
+//! at all — so a replayer has to supply the transaction's own sequence number
+//! and cannot read one out of the record. That is why applying takes an
+//! `lsn`; [`crate::format::log_items::log_dinode`] goes further and forbids
+//! recovering a logged `di_lsn` into the inode even when it is present.
+//!
+//! # Inode clusters carry no block checksum
+//!
+//! A logged inode is addressed through its cluster, and a cluster is inodes
+//! laid end to end: per-object CRCs and self-identifiers, with the buffer
+//! verifier only checking that the magics are in the expected slots. So an
+//! inode item is applied to one inode's bytes and restamped as one inode,
+//! which is the opposite of what a block item needs. What is still refused is
+//! a fork logged alongside the core, whose bytes belong at `di_forkoff`.
 
 use std::sync::Arc;
 
@@ -37,21 +52,61 @@ use crate::ag::offsets as ag_offsets;
 use crate::ag::{XFS_AGF_MAGIC, XFS_AGI_MAGIC};
 use crate::alloc_btree::{XFS_ABTB_CRC_MAGIC, XFS_ABTB_MAGIC, XFS_ABTC_CRC_MAGIC, XFS_ABTC_MAGIC};
 use crate::bmbt::{XFS_BMAP_CRC_MAGIC, XFS_BMAP_MAGIC};
-use crate::endian::{be32, le32, le64};
+use crate::endian::{be16, be32, be64, le32, le64};
 use crate::error::{Error, Result};
+use crate::format::dir::offsets::da_blk;
+use crate::format::dir::offsets::dir3_blk;
+use crate::format::dir::{
+    XFS_DA3_NODE_MAGIC, XFS_DIR3_BLOCK_MAGIC, XFS_DIR3_DATA_MAGIC, XFS_DIR3_FREE_MAGIC,
+    XFS_DIR3_LEAF1_MAGIC, XFS_DIR3_LEAFN_MAGIC,
+};
 use crate::format::log_items::{
     buf_log_format::{offsets as blf, BLF_CHUNK, BLF_HEADER_SIZE},
+    inode_log_format::{
+        offsets as ilf, INODE_LOG_FORMAT_SIZE, XFS_ILOG_ADATA, XFS_ILOG_AEXT, XFS_ILOG_CORE,
+        XFS_ILOG_DDATA, XFS_ILOG_DEXT,
+    },
     item_types::{XFS_LI_BUF, XFS_LI_INODE},
+    log_dinode::{offsets as dinode, DI_VERSION_3, LOG_DINODE_SIZE, XFS_DINODE_MAGIC},
     BBSIZE,
 };
-use crate::log_write::Op;
+use crate::log_write::{log_dinode_to_disk, Op};
 use crate::superblock::{crc32c_with_zeroed_crc, Superblock};
+
+/// A block's type marker: where it sits, and how wide it is.
+///
+/// The width matters because directory and attribute blocks lead with two
+/// sibling pointers, so their magic is a `u16` further into the header,
+/// while every other kind here opens with a `u32` magic.
+enum Magic {
+    Be32 { off: usize, value: u32 },
+    Be16 { off: usize, value: u16 },
+}
+
+impl Magic {
+    fn is_at(&self, buf: &[u8]) -> bool {
+        match self {
+            Magic::Be32 { off, value } => buf.len() >= off + 4 && be32(buf, *off) == *value,
+            Magic::Be16 { off, value } => buf.len() >= off + 2 && be16(buf, *off) == *value,
+        }
+    }
+
+    /// How far into a block this marker reaches, so a kind can demand that
+    /// much buffer before reading its own fields out of it.
+    fn reach(&self) -> usize {
+        match self {
+            Magic::Be32 { off, .. } => *off + 4,
+            Magic::Be16 { off, .. } => *off + 2,
+        }
+    }
+}
 
 /// A block whose CRC can be restamped: the magic that identifies it, the
 /// field's offset, and how much of the block the checksum covers.
 struct CrcKind {
-    magic: u32,
+    magic: Magic,
     crc_off: usize,
+    lsn_off: usize,
     /// `Sector` for AG headers, `FsBlock` for B+tree blocks.
     span: Span,
 }
@@ -66,43 +121,133 @@ enum Span {
 /// repeated here.
 const CRC_KINDS: &[CrcKind] = &[
     CrcKind {
-        magic: XFS_AGF_MAGIC,
+        magic: Magic::Be32 {
+            off: 0,
+            value: XFS_AGF_MAGIC,
+        },
         crc_off: ag_offsets::agf::CRC,
+        lsn_off: ag_offsets::agf::LSN,
         span: Span::Sector,
     },
     CrcKind {
-        magic: XFS_AGI_MAGIC,
+        magic: Magic::Be32 {
+            off: 0,
+            value: XFS_AGI_MAGIC,
+        },
         crc_off: ag_offsets::agi::CRC,
+        lsn_off: ag_offsets::agi::LSN,
         span: Span::Sector,
     },
     CrcKind {
-        magic: XFS_ABTB_CRC_MAGIC,
+        magic: Magic::Be32 {
+            off: 0,
+            value: XFS_ABTB_CRC_MAGIC,
+        },
         crc_off: crate::alloc_btree::offsets::CRC,
+        lsn_off: crate::alloc_btree::offsets::LSN,
         span: Span::FsBlock,
     },
     CrcKind {
-        magic: XFS_ABTB_MAGIC,
+        magic: Magic::Be32 {
+            off: 0,
+            value: XFS_ABTB_MAGIC,
+        },
         crc_off: crate::alloc_btree::offsets::CRC,
+        lsn_off: crate::alloc_btree::offsets::LSN,
         span: Span::FsBlock,
     },
     CrcKind {
-        magic: XFS_ABTC_CRC_MAGIC,
+        magic: Magic::Be32 {
+            off: 0,
+            value: XFS_ABTC_CRC_MAGIC,
+        },
         crc_off: crate::alloc_btree::offsets::CRC,
+        lsn_off: crate::alloc_btree::offsets::LSN,
         span: Span::FsBlock,
     },
     CrcKind {
-        magic: XFS_ABTC_MAGIC,
+        magic: Magic::Be32 {
+            off: 0,
+            value: XFS_ABTC_MAGIC,
+        },
         crc_off: crate::alloc_btree::offsets::CRC,
+        lsn_off: crate::alloc_btree::offsets::LSN,
         span: Span::FsBlock,
     },
     CrcKind {
-        magic: XFS_BMAP_CRC_MAGIC,
+        magic: Magic::Be32 {
+            off: 0,
+            value: XFS_BMAP_CRC_MAGIC,
+        },
         crc_off: crate::bmbt::offsets::CRC,
+        lsn_off: crate::bmbt::offsets::LSN,
         span: Span::FsBlock,
     },
     CrcKind {
-        magic: XFS_BMAP_MAGIC,
+        magic: Magic::Be32 {
+            off: 0,
+            value: XFS_BMAP_MAGIC,
+        },
         crc_off: crate::bmbt::offsets::CRC,
+        lsn_off: crate::bmbt::offsets::LSN,
+        span: Span::FsBlock,
+    },
+    // Directory blocks, all little-endian-checksummed over one filesystem
+    // block. The three that lead with their magic share `dir3_blk`; the
+    // index blocks that lead with sibling pointers share `da_blk`, whose
+    // magic, checksum and sequence number all sit 8 bytes later.
+    CrcKind {
+        magic: Magic::Be32 {
+            off: dir3_blk::MAGIC,
+            value: XFS_DIR3_DATA_MAGIC,
+        },
+        crc_off: dir3_blk::CRC,
+        lsn_off: dir3_blk::LSN,
+        span: Span::FsBlock,
+    },
+    CrcKind {
+        magic: Magic::Be32 {
+            off: dir3_blk::MAGIC,
+            value: XFS_DIR3_BLOCK_MAGIC,
+        },
+        crc_off: dir3_blk::CRC,
+        lsn_off: dir3_blk::LSN,
+        span: Span::FsBlock,
+    },
+    CrcKind {
+        magic: Magic::Be32 {
+            off: dir3_blk::MAGIC,
+            value: XFS_DIR3_FREE_MAGIC,
+        },
+        crc_off: dir3_blk::CRC,
+        lsn_off: dir3_blk::LSN,
+        span: Span::FsBlock,
+    },
+    CrcKind {
+        magic: Magic::Be16 {
+            off: da_blk::MAGIC,
+            value: XFS_DIR3_LEAF1_MAGIC,
+        },
+        crc_off: da_blk::CRC,
+        lsn_off: da_blk::LSN,
+        span: Span::FsBlock,
+    },
+    CrcKind {
+        magic: Magic::Be16 {
+            off: da_blk::MAGIC,
+            value: XFS_DIR3_LEAFN_MAGIC,
+        },
+        crc_off: da_blk::CRC,
+        lsn_off: da_blk::LSN,
+        span: Span::FsBlock,
+    },
+    CrcKind {
+        magic: Magic::Be16 {
+            off: da_blk::MAGIC,
+            value: XFS_DA3_NODE_MAGIC,
+        },
+        crc_off: da_blk::CRC,
+        lsn_off: da_blk::LSN,
         span: Span::FsBlock,
     },
 ];
@@ -200,51 +345,242 @@ fn parse_buf(ops: &[Op], at: usize) -> Result<(BufItem, usize)> {
 }
 
 impl CrcKind {
-    /// Whether this is the format the block is actually in: the stored
-    /// checksum has to come out of the block's own bytes.
-    fn matches(&self, buf: &[u8], sb: &Superblock) -> bool {
-        // Metadata magics are big-endian on disk; only the checksum
-        // field itself is little-endian (see `crate::ag`).
-        if buf.len() < 4 || be32(buf, 0) != self.magic {
-            return false;
-        }
-        let span = match self.span {
+    /// The bytes the checksum of this kind covers, clamped to what was read.
+    fn span(&self, buf: &[u8], sb: &Superblock) -> usize {
+        let full = match self.span {
             Span::Sector => usize::from(sb.sectsize),
             Span::FsBlock => sb.blocksize as usize,
         };
-        let span = span.min(buf.len());
-        if span <= self.crc_off + 4 {
-            return false;
-        }
-        le32(buf, self.crc_off) == crc32c_with_zeroed_crc(&buf[..span], self.crc_off)
+        full.min(buf.len())
     }
 
-    fn restamp(&self, buf: &mut [u8], sb: &Superblock) {
-        let span = match self.span {
-            Span::Sector => usize::from(sb.sectsize),
-            Span::FsBlock => sb.blocksize as usize,
+    /// Whether this is the format the block is actually in: the stored
+    /// checksum has to come out of the block's own bytes.
+    fn matches(&self, buf: &[u8], sb: &Superblock) -> bool {
+        // The magic decides the kind; the checksum then decides that this
+        // kind's offsets are the ones the writer used. Both are needed,
+        // because a truncated or wrong-kind buffer can carry a magic and no
+        // usable checksum field.
+        if buf.len() < self.reach().max(self.crc_off + 4) {
+            return false;
         }
-        .min(buf.len());
+        if !self.magic.is_at(buf) {
+            return false;
+        }
+        let span = self.span(buf, sb);
+        span > self.crc_off + 4
+            && le32(buf, self.crc_off) == crc32c_with_zeroed_crc(&buf[..span], self.crc_off)
+    }
+
+    /// Width of the header this kind needs intact, so a short buffer cannot
+    /// be read past its own fields.
+    fn reach(&self) -> usize {
+        self.magic
+            .reach()
+            .max(self.crc_off + 4)
+            .max(self.lsn_off + 8)
+    }
+
+    /// Stamp this transaction's sequence number in, then recompute the
+    /// checksum over what the block now says.
+    ///
+    /// That order is upstream's: the write verifier assigns the LSN and only
+    /// then calls `xfs_update_cksum`, so stamping afterwards would leave a
+    /// checksum over bytes that no longer match it.
+    fn restamp(&self, buf: &mut [u8], sb: &Superblock, lsn: u64) {
+        if buf.len() >= self.lsn_off + 8 {
+            buf[self.lsn_off..self.lsn_off + 8].copy_from_slice(&lsn.to_be_bytes());
+        }
+        let span = self.span(buf, sb);
         let crc = crc32c_with_zeroed_crc(&buf[..span], self.crc_off);
         buf[self.crc_off..self.crc_off + 4].copy_from_slice(&crc.to_le_bytes());
     }
 }
 
-/// Apply every buffer item in `ops` to `device`.
+/// A parsed inode item: which inode, where its cluster is, and the core.
+struct InodeItem {
+    ino: u64,
+    /// Basic-block address of the cluster, not of the inode.
+    blkno: u64,
+    /// Cluster length in basic blocks.
+    len_bb: u32,
+    /// The inode's byte offset within the cluster.
+    boffset: u32,
+    /// `xfs_log_dinode`, as logged.
+    core: Vec<u8>,
+}
+
+/// Parse one inode item's format operation and take the core from the next.
+fn parse_inode(ops: &[Op], at: usize) -> Result<(InodeItem, usize)> {
+    let fmt = &ops[at].data;
+    if fmt.len() < INODE_LOG_FORMAT_SIZE {
+        return Err(Error::CorruptLog(format!(
+            "an inode item's format operation is {} bytes, shorter than the \
+             {INODE_LOG_FORMAT_SIZE}-byte header",
+            fmt.len()
+        )));
+    }
+    let size = u16::from_le_bytes([fmt[ilf::SIZE], fmt[ilf::SIZE + 1]]) as usize;
+    if size < 2 {
+        return Err(Error::CorruptLog(format!(
+            "an inode item claims {size} operations, which cannot include its core"
+        )));
+    }
+    if at + size > ops.len() {
+        return Err(Error::CorruptLog(format!(
+            "an inode item needs {size} operations and only {} remain",
+            ops.len() - at
+        )));
+    }
+    let fields = le32(fmt, ilf::FIELDS);
+    if fields & XFS_ILOG_CORE == 0 {
+        return Err(Error::CorruptLog(format!(
+            "an inode item logs fields {fields:#010x} without XFS_ILOG_CORE, so there is no \
+             core to apply"
+        )));
+    }
+    let fork = fields & (XFS_ILOG_DDATA | XFS_ILOG_DEXT | XFS_ILOG_ADATA | XFS_ILOG_AEXT);
+    if fork != 0 {
+        // The fork's bytes belong at `di_forkoff` inside the inode, or in
+        // blocks the core's own counts point at, so applying them is a
+        // second step rather than part of this one.
+        return Err(Error::UnsupportedFeature(format!(
+            "an inode item logging a data or attribute fork ({fork:#010x}) is not applied; \
+             only the core is, and the fork's bytes would have to land at di_forkoff"
+        )));
+    }
+    Ok((
+        InodeItem {
+            ino: le64(fmt, ilf::INO),
+            blkno: le64(fmt, ilf::BLKNO),
+            len_bb: le32(fmt, ilf::LEN) as u32,
+            boffset: le32(fmt, ilf::BOFFSET) as u32,
+            core: ops[at + 1].data.clone(),
+        },
+        size,
+    ))
+}
+
+/// Patch one inode's core into its cluster and restamp the inode's own CRC.
 ///
-/// Returns how many byte runs were written. Operations of a kind this cannot
-/// apply are refused with the missing case named, so a caller never ends up
-/// with half a transaction on disk and a success to show for it.
+/// Returns whether the inode was written: a cluster already carrying a newer
+/// sequence number is left alone, which is a correct outcome, not a failure.
+fn apply_inode(
+    device: &Arc<dyn BlockDevice>,
+    sb: &Superblock,
+    item: &InodeItem,
+    lsn: u64,
+) -> Result<bool> {
+    let inodesize = usize::from(sb.inodesize);
+    let cluster = item.len_bb as usize * BBSIZE;
+    // The item's own buffer length is trusted only within the bounds this
+    // geometry allows; a huge one is a damaged field, not a large read.
+    if !(inodesize..=sb.inode_cluster_bytes() as usize).contains(&cluster) {
+        return Err(Error::CorruptLog(format!(
+            "an inode item for inode {} names a {}-byte buffer, outside this geometry's \
+             inodesize {inodesize}..cluster {}",
+            item.ino,
+            cluster,
+            sb.inode_cluster_bytes(),
+        )));
+    }
+    let boff = item.boffset as usize;
+    if boff % inodesize != 0 || boff + inodesize > cluster {
+        return Err(Error::CorruptLog(format!(
+            "an inode item puts inode {} at offset {boff} of a {cluster}-byte buffer of \
+             {inodesize}-byte inodes",
+            item.ino
+        )));
+    }
+    // A logged core too short to hold a v3 layout, or belonging to a version
+    // this step cannot lay out on disk: v2 inodes have no checksum field to
+    // restamp, and a v5 filesystem does not use them, so reaching one means
+    // the addressing is wrong rather than merely old.
+    if item.core.len() < LOG_DINODE_SIZE {
+        return Err(Error::CorruptLog(format!(
+            "an inode item for inode {} carries a {}-byte core, shorter than a v3 core's {LOG_DINODE_SIZE}",
+            item.ino,
+            item.core.len()
+        )));
+    }
+    if item.core[dinode::VERSION] != DI_VERSION_3 {
+        return Err(Error::UnsupportedFeature(format!(
+            "an inode item for inode {} logs version {}, which this step cannot write back",
+            item.ino,
+            item.core[dinode::VERSION]
+        )));
+    }
+    let core = log_dinode_to_disk(&item.core)
+        .map_err(|why| Error::CorruptLog(format!("inode item for inode {}: {why}", item.ino)))?;
+    if core.len() > inodesize {
+        return Err(Error::CorruptLog(format!(
+            "a {}-byte logged core does not fit a {inodesize}-byte inode",
+            core.len()
+        )));
+    }
+
+    let daddr = item.blkno * BBSIZE as u64;
+    let mut buf = vec![0u8; cluster];
+    device.read_at(daddr, &mut buf)?;
+    let mut inode = buf[boff..boff + inodesize].to_vec();
+
+    // The cluster addresses the inode, so nothing else has checked that it
+    // is the *same* inode. An allocated one states its own number; a free
+    // slot says nothing and is this item's to fill.
+    if be16(&inode, dinode::MAGIC) == XFS_DINODE_MAGIC {
+        let here = be64(&inode, dinode::INO);
+        if here != item.ino {
+            return Err(Error::CorruptLog(format!(
+                "an inode item for inode {} lands on inode {here} at byte {boff} of buffer \
+                 block {}",
+                item.ino, item.blkno
+            )));
+        }
+        // Upstream compares the on-disk sequence number against the
+        // transaction's and skips a strictly newer inode, because the logged
+        // `di_lsn` cannot be trusted for that decision and the disk's own can.
+        let stamped = be64(&inode, dinode::LSN);
+        if stamped != 0 && stamped != u64::MAX && stamped > lsn {
+            return Ok(false);
+        }
+    }
+
+    inode[..core.len()].copy_from_slice(&core);
+    inode[dinode::LSN..dinode::LSN + 8].copy_from_slice(&lsn.to_be_bytes());
+    // The inode's checksum covers the whole inode, not the core, so it has to
+    // be recomputed over `inodesize` bytes after the fork area below the core
+    // has been read back in.
+    let crc = crc32c_with_zeroed_crc(&inode, dinode::CRC);
+    inode[dinode::CRC..dinode::CRC + 4].copy_from_slice(&crc.to_le_bytes());
+    buf[boff..boff + inodesize].copy_from_slice(&inode);
+    // The whole cluster goes back, as the kernel writes the whole buffer:
+    // an inode is not necessarily a whole sector, and a sub-sector write is
+    // not something every device can honour.
+    device.write_at(daddr, &buf)?;
+    Ok(true)
+}
+
+/// Apply one transaction's items to the blocks and inodes they describe.
+///
+/// Returns how many byte runs were written — one per buffer item's run and
+/// one per inode applied. Operations of a kind this cannot apply are refused
+/// with the missing case named, so a caller never ends up with half a
+/// transaction on disk and a success to show for it.
+///
+/// `lsn` is this transaction's log sequence number, `(cycle << 32 | block)`,
+/// and is written into every object touched: a replayer has to supply it,
+/// because neither the checksum nor the sequence number is logged.
 ///
 /// # Errors
 ///
 /// [`Error::CorruptLog`] for a malformed or truncated item, [`Error::BadSuperblock`]
 /// for a block whose checksum format is not recognised, [`Error::UnsupportedFeature`]
 /// for an item kind that is not applied here, and whatever the device returns.
-pub fn apply_buf_items(
+pub fn apply_transaction(
     device: &Arc<dyn BlockDevice>,
     sb: &Superblock,
     ops: &[Op],
+    lsn: u64,
 ) -> Result<usize> {
     let mut written = 0usize;
     let mut at = 0usize;
@@ -260,16 +596,16 @@ pub fn apply_buf_items(
         match kind {
             XFS_LI_BUF => {
                 let (item, consumed) = parse_buf(ops, at)?;
-                apply_one(device, sb, &item, &ops[at + 1..at + consumed])?;
+                apply_one(device, sb, &item, &ops[at + 1..at + consumed], lsn)?;
                 written += item.runs.len();
                 at += consumed;
             }
             XFS_LI_INODE => {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode items are not applied yet (operation {at} of this transaction); \
-                     the logged chunk needs the cluster/offset addressing and must not be \
-                     copied verbatim"
-                )));
+                let (item, consumed) = parse_inode(ops, at)?;
+                if apply_inode(device, sb, &item, lsn)? {
+                    written += 1;
+                }
+                at += consumed;
             }
             other => {
                 return Err(Error::UnsupportedFeature(format!(
@@ -287,6 +623,7 @@ fn apply_one(
     sb: &Superblock,
     item: &BufItem,
     payloads: &[Op],
+    lsn: u64,
 ) -> Result<()> {
     let daddr = item.blkno * BBSIZE as u64;
     let mut buf = vec![0u8; sb.blocksize as usize];
@@ -317,7 +654,7 @@ fn apply_one(
         buf[*offset..*offset + len].copy_from_slice(&op.data);
     }
 
-    kind.restamp(&mut buf, sb);
+    kind.restamp(&mut buf, sb, lsn);
     device.write_at(daddr, &buf)?;
     Ok(())
 }
@@ -328,7 +665,13 @@ mod tests {
     use crate::ag::offsets as ag_off;
     use crate::ag::XFS_AGF_MAGIC;
     use crate::format::log_items::buf_log_format::offsets as blf_off;
+    use crate::format::log_items::inode_log_format::offsets as ilf_off;
+    use crate::format::log_items::log_dinode::offsets as di;
+    use crate::log_write::{inode_log_format, log_dinode_from_disk, InodeBuffer};
     use std::sync::Mutex;
+
+    /// A transaction's log sequence number: cycle 1, log block 40.
+    const LSN: u64 = (1 << 32) | 40;
 
     /// A device of `blocks` filesystem blocks, addressable by byte offset.
     struct Mem {
@@ -461,7 +804,7 @@ mod tests {
         // (patch, then stamp) and the wrong place to look for the patch.
         let ops = buf_item(0, 3, payload.clone());
 
-        let runs = apply_buf_items(&dev, &sb, &ops).expect("apply one buffer item");
+        let runs = apply_transaction(&dev, &sb, &ops, LSN).expect("apply one buffer item");
         assert_eq!(runs, 1);
 
         let mut after = vec![0u8; 4096];
@@ -477,9 +820,16 @@ mod tests {
             "untouched chunks must stay untouched"
         );
         assert_eq!(
+            be64(&after, ag_off::agf::LSN),
+            LSN,
+            "the block's sequence number has to become this transaction's, since neither it \
+             nor the checksum is logged"
+        );
+        assert_eq!(
             le32(&after, ag_off::agf::CRC),
             crc32c_with_zeroed_crc(&after[..512], ag_off::agf::CRC),
-            "the restamped checksum has to verify against the block's own bytes"
+            "the restamped checksum has to verify against the block's own bytes, sequence \
+             number included"
         );
     }
 
@@ -493,7 +843,7 @@ mod tests {
         block[0..4].copy_from_slice(&0x58534441u32.to_be_bytes()); // "XSDA": not a kind here
         let dev = device_with(&block);
         let ops = buf_item(0, 0, vec![0x11u8; BLF_CHUNK]);
-        let err = apply_buf_items(&dev, &sb, &ops)
+        let err = apply_transaction(&dev, &sb, &ops, LSN)
             .expect_err("an unknown block kind must not be applied");
         assert!(
             err.to_string().contains("checksum"),
@@ -510,11 +860,232 @@ mod tests {
         let dev = device_with(&agf_block(&sb));
         let mut data = vec![0u8; 4];
         data[0..2].copy_from_slice(&XFS_LI_INODE.to_le_bytes());
-        let err = apply_buf_items(&dev, &sb, &[Op { flags: 0, data }])
-            .expect_err("inode items are not applied yet");
+        let err = apply_transaction(&dev, &sb, &[Op { flags: 0, data }], LSN)
+            .expect_err("an inode item without a core is not applicable");
         assert!(
-            matches!(err, Error::UnsupportedFeature(_)),
-            "the refusal should name the missing kind: {err}"
+            matches!(err, Error::CorruptLog(_)),
+            "a one-operation inode item should be reported as malformed: {err}"
+        );
+    }
+
+    /// An allocated v3 inode of `ino`, with a checksum that is its own.
+    ///
+    /// `flags2` stays zero, so the core uses the base layout: `bigtime` and
+    /// `nrext64` move fields, and how the logged form tracks them is
+    /// `log_dinode_from_disk`'s own concern, tested there.
+    fn disk_inode(sb: &Superblock, ino: u64) -> Vec<u8> {
+        let mut b = vec![0u8; usize::from(sb.inodesize)];
+        b[di::MAGIC..di::MAGIC + 2].copy_from_slice(&XFS_DINODE_MAGIC.to_be_bytes());
+        b[di::VERSION] = DI_VERSION_3;
+        b[di::MODE..di::MODE + 2].copy_from_slice(&0o100644u16.to_be_bytes());
+        b[di::NLINK..di::NLINK + 4].copy_from_slice(&1u32.to_be_bytes());
+        b[di::INO..di::INO + 8].copy_from_slice(&ino.to_be_bytes());
+        b[di::NEXT_UNLINKED..di::NEXT_UNLINKED + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        let crc = crc32c_with_zeroed_crc(&b, di::CRC);
+        b[di::CRC..di::CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        b
+    }
+
+    /// One inode item: the format operation naming `buffer`, then the core.
+    fn inode_item(ino: u64, fields: u32, buffer: &InodeBuffer, core: &[u8]) -> Vec<Op> {
+        let mut fmt = inode_log_format(ino, fields, buffer);
+        fmt[ilf_off::TYPE..ilf_off::TYPE + 2].copy_from_slice(&XFS_LI_INODE.to_le_bytes());
+        vec![
+            Op {
+                flags: 0,
+                data: fmt,
+            },
+            Op {
+                flags: 0,
+                data: core.to_vec(),
+            },
+        ]
+    }
+
+    /// The round trip the replayer depends on: log an inode, apply it back,
+    /// and the inode on disk is the one that went in — with the two fields a
+    /// log cannot carry (`di_lsn`, `di_crc`) replaced by this transaction's.
+    #[test]
+    fn a_logged_inode_core_round_trips_into_the_cluster_slot_it_was_addressed_to() {
+        let sb = sb_v5();
+        let cluster = sb.inode_cluster_bytes() as usize;
+        let boff = usize::from(sb.inodesize); // the cluster's second inode
+        let before = disk_inode(&sb, 64);
+
+        let mut image = vec![0u8; cluster];
+        image[boff..boff + before.len()].copy_from_slice(&before);
+        let dev = Arc::new(Mem {
+            bytes: Mutex::new(image.clone()),
+        }) as Arc<dyn BlockDevice>;
+
+        let buffer = InodeBuffer::containing(boff as u64, sb.inode_cluster_bytes());
+        assert_eq!(
+            (buffer.blkno, buffer.len, buffer.boffset),
+            (0, cluster as u32 / BBSIZE as u32, boff as u32),
+            "the cluster is addressed absolutely, so its first inode sits at offset 0"
+        );
+        let core = log_dinode_from_disk(&before).expect("log the inode");
+        let ops = inode_item(64, XFS_ILOG_CORE, &buffer, &core);
+
+        let runs = apply_transaction(&dev, &sb, &ops, LSN).expect("apply the inode item");
+        assert_eq!(runs, 1);
+
+        let mut after = vec![0u8; cluster];
+        dev.read_at(0, &mut after).unwrap();
+        let got = &after[boff..boff + usize::from(sb.inodesize)];
+
+        // Everything the log does carry has to come back identical.
+        let strip = |b: &[u8]| {
+            let mut v = b.to_vec();
+            v[di::CRC..di::CRC + 4].fill(0);
+            v[di::LSN..di::LSN + 8].fill(0);
+            v
+        };
+        assert_eq!(
+            strip(got),
+            strip(&before),
+            "the applied inode differs from the logged one only in the fields a log cannot carry"
+        );
+        assert_eq!(
+            be64(got, di::LSN),
+            LSN,
+            "the inode's sequence number is the transaction's, never the logged core's"
+        );
+        assert_eq!(
+            le32(got, di::CRC),
+            crc32c_with_zeroed_crc(got, di::CRC),
+            "an inode's checksum covers the whole inode, so it is recomputed, not copied"
+        );
+        // The rest of the cluster is somebody else's inode.
+        assert_eq!(
+            &after[0..boff],
+            &image[0..boff],
+            "applying one inode must not touch the neighbours packed into its cluster"
+        );
+        assert_eq!(
+            &after[boff + usize::from(sb.inodesize)..],
+            &image[boff + usize::from(sb.inodesize)..],
+            "applying one inode must not touch the neighbours packed into its cluster"
+        );
+    }
+
+    /// The cluster and offset address an inode; nothing else has checked that
+    /// they address the one the item names. Getting this wrong while the
+    /// checksum still works is how a replayer would silently relocate files.
+    #[test]
+    fn an_inode_item_naming_a_different_inode_than_occupies_the_slot_is_refused() {
+        let sb = sb_v5();
+        let cluster = sb.inode_cluster_bytes() as usize;
+        let boff = usize::from(sb.inodesize);
+        let before = disk_inode(&sb, 64);
+        let mut image = vec![0u8; cluster];
+        image[boff..boff + before.len()].copy_from_slice(&before);
+        let dev = Arc::new(Mem {
+            bytes: Mutex::new(image.clone()),
+        }) as Arc<dyn BlockDevice>;
+
+        let buffer = InodeBuffer::containing(boff as u64, sb.inode_cluster_bytes());
+        let core = log_dinode_from_disk(&before).expect("log the inode");
+        let ops = inode_item(99, XFS_ILOG_CORE, &buffer, &core);
+
+        let err = apply_transaction(&dev, &sb, &ops, LSN)
+            .expect_err("an item cannot claim a slot that holds another inode");
+        let why = err.to_string();
+        assert!(
+            why.contains("99") && why.contains("64"),
+            "the refusal should name both inode numbers: {why}"
+        );
+        let mut same = vec![0u8; cluster];
+        dev.read_at(0, &mut same).unwrap();
+        assert_eq!(same, image, "a refusal must not leave the cluster edited");
+    }
+
+    /// Upstream compares the disk inode's own sequence number against the
+    /// transaction's and leaves a strictly newer one alone, which is what
+    /// makes replaying an older checkpoint harmless.
+    #[test]
+    fn an_inode_already_stamped_by_a_newer_transaction_is_left_alone() {
+        let sb = sb_v5();
+        let cluster = sb.inode_cluster_bytes() as usize;
+        let boff = usize::from(sb.inodesize);
+        let mut before = disk_inode(&sb, 64);
+        before[di::LSN..di::LSN + 8].copy_from_slice(&(LSN + 1).to_be_bytes());
+        let crc = crc32c_with_zeroed_crc(&before, di::CRC);
+        before[di::CRC..di::CRC + 4].copy_from_slice(&crc.to_le_bytes());
+
+        let mut image = vec![0u8; cluster];
+        image[boff..boff + before.len()].copy_from_slice(&before);
+        let dev = Arc::new(Mem {
+            bytes: Mutex::new(image.clone()),
+        }) as Arc<dyn BlockDevice>;
+
+        let buffer = InodeBuffer::containing(boff as u64, sb.inode_cluster_bytes());
+        let core = log_dinode_from_disk(&before).expect("log the inode");
+        let ops = inode_item(64, XFS_ILOG_CORE, &buffer, &core);
+
+        let runs = apply_transaction(&dev, &sb, &ops, LSN).expect("skipping is not failing");
+        assert_eq!(
+            runs, 0,
+            "the newer inode on disk wins, so nothing is written"
+        );
+        let mut same = vec![0u8; cluster];
+        dev.read_at(0, &mut same).unwrap();
+        assert_eq!(same, image);
+    }
+
+    /// A core can be logged with fork bytes after it. Those belong at
+    /// `di_forkoff`, which is a different step, so the whole item is refused
+    /// rather than half-applied.
+    #[test]
+    fn an_inode_item_logging_a_fork_with_its_core_is_refused_by_name() {
+        let sb = sb_v5();
+        let before = disk_inode(&sb, 64);
+        let mut image = vec![0u8; sb.inode_cluster_bytes() as usize];
+        image[0..before.len()].copy_from_slice(&before);
+        let dev = Arc::new(Mem {
+            bytes: Mutex::new(image.clone()),
+        }) as Arc<dyn BlockDevice>;
+
+        let buffer = InodeBuffer::containing(0, sb.inode_cluster_bytes());
+        let core = log_dinode_from_disk(&before).expect("log the inode");
+        let ops = inode_item(64, XFS_ILOG_CORE | XFS_ILOG_DDATA, &buffer, &core);
+
+        let err = apply_transaction(&dev, &sb, &ops, LSN)
+            .expect_err("fork bytes are not applied with the core");
+        assert!(
+            matches!(err, Error::UnsupportedFeature(_)) && err.to_string().contains("fork"),
+            "the refusal should name the missing case: {err}"
+        );
+    }
+
+    /// A directory index block keeps its magic a `u16` eight bytes in, behind
+    /// the two sibling pointers — the shape that made a scan of offset 0
+    /// conclude the checksum was nowhere. Recognising it is what lets a
+    /// renamed entry's block be restamped instead of refused.
+    #[test]
+    fn a_directory_index_block_is_recognised_by_the_magic_eight_bytes_in() {
+        let sb = sb_v5();
+        let mut block = vec![0u8; 4096];
+        block[da_blk::MAGIC..da_blk::MAGIC + 2]
+            .copy_from_slice(&XFS_DIR3_LEAFN_MAGIC.to_be_bytes());
+        let crc = crc32c_with_zeroed_crc(&block, da_blk::CRC);
+        block[da_blk::CRC..da_blk::CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        let dev = device_with(&block);
+
+        let ops = buf_item(0, 5, vec![0x77u8; BLF_CHUNK]);
+        let runs = apply_transaction(&dev, &sb, &ops, LSN).expect("apply to a leaf block");
+        assert_eq!(runs, 1);
+
+        let mut after = vec![0u8; 4096];
+        dev.read_at(0, &mut after).unwrap();
+        assert!(after[5 * BLF_CHUNK..6 * BLF_CHUNK]
+            .iter()
+            .all(|&x| x == 0x77));
+        assert_eq!(be64(&after, da_blk::LSN), LSN);
+        assert_eq!(
+            le32(&after, da_blk::CRC),
+            crc32c_with_zeroed_crc(&after, da_blk::CRC),
+            "the leaf's checksum covers the whole block, as measured"
         );
     }
 
@@ -526,7 +1097,7 @@ mod tests {
         let dev = device_with(&agf_block(&sb));
         let mut ops = buf_item(0, 0, vec![0x22u8; BLF_CHUNK]);
         ops[1].data.push(0); // one byte too many for the single bit set
-        let err = apply_buf_items(&dev, &sb, &ops).expect_err("a short item must not apply");
+        let err = apply_transaction(&dev, &sb, &ops, LSN).expect_err("a short item must not apply");
         assert!(
             err.to_string().contains("covers"),
             "expected the count mismatch: {err}"
