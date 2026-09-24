@@ -84,6 +84,30 @@ pub fn le32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
+/// Read the little-endian `u64` at `off`.
+///
+/// The log's item structures are the ones that use this: an on-disk
+/// superblock or btree header is big-endian, while a log item is copied
+/// out of native memory, so its 64-bit fields — a buffer item's device
+/// address above all — are little-endian.
+///
+/// # Panics
+///
+/// Panics if `off + 8` exceeds `b`. See [`be16`].
+#[inline]
+pub fn le64(b: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        b[off],
+        b[off + 1],
+        b[off + 2],
+        b[off + 3],
+        b[off + 4],
+        b[off + 5],
+        b[off + 6],
+        b[off + 7],
+    ])
+}
+
 /// Copy the 16-byte UUID at `off`.
 ///
 /// # Panics

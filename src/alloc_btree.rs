@@ -86,7 +86,7 @@ const PTR_LEN: usize = 4;
 const MAX_LEVELS: u16 = 9;
 
 /// Byte offsets within the short-form block header.
-mod offsets {
+pub(crate) mod offsets {
     pub const MAGIC: usize = 0;
     pub const LEVEL: usize = 4;
     pub const NUMRECS: usize = 6;

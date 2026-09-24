@@ -69,7 +69,7 @@ const KEY_LEN: usize = 8;
 const PTR_LEN: usize = 8;
 
 /// Byte offsets within an on-disk node header.
-mod offsets {
+pub(crate) mod offsets {
     pub const MAGIC: usize = 0;
     pub const LEVEL: usize = 4;
     pub const NUMRECS: usize = 6;
