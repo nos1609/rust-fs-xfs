@@ -37,7 +37,7 @@ use crate::ag::offsets as ag_offsets;
 use crate::ag::{XFS_AGF_MAGIC, XFS_AGI_MAGIC};
 use crate::alloc_btree::{XFS_ABTB_CRC_MAGIC, XFS_ABTB_MAGIC, XFS_ABTC_CRC_MAGIC, XFS_ABTC_MAGIC};
 use crate::bmbt::{XFS_BMAP_CRC_MAGIC, XFS_BMAP_MAGIC};
-use crate::endian::{le32, le64};
+use crate::endian::{be32, le32, le64};
 use crate::error::{Error, Result};
 use crate::format::log_items::{
     buf_log_format::{offsets as blf, BLF_CHUNK, BLF_HEADER_SIZE},
@@ -203,7 +203,9 @@ impl CrcKind {
     /// Whether this is the format the block is actually in: the stored
     /// checksum has to come out of the block's own bytes.
     fn matches(&self, buf: &[u8], sb: &Superblock) -> bool {
-        if buf.len() < 4 || le32(buf, 0) != self.magic {
+        // Metadata magics are big-endian on disk; only the checksum
+        // field itself is little-endian (see `crate::ag`).
+        if buf.len() < 4 || be32(buf, 0) != self.magic {
             return false;
         }
         let span = match self.span {
@@ -298,7 +300,7 @@ fn apply_one(
                 "block at device address {} (magic {:#010x}) is not a kind whose checksum \
                  this step knows; refusing rather than leave it with a stale CRC",
                 item.blkno,
-                le32(&buf, 0)
+                be32(&buf, 0)
             ))
         })?;
 
@@ -352,20 +354,64 @@ mod tests {
         }
     }
 
-    impl fs_core::BlockDevice for Mem {}
+    impl fs_core::BlockDevice for Mem {
+        // Without this the trait's read-only default answers every apply
+        // with "device is read-only", which reads like a production bug
+        // and is only a fixture that forgot to let anyone write.
+        fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+            let mut b = self.bytes.lock().unwrap();
+            let start = offset as usize;
+            if start + buf.len() > b.len() {
+                return Err(fs_core::Error::ShortRead {
+                    offset,
+                    want: buf.len(),
+                    got: 0,
+                });
+            }
+            b[start..start + buf.len()].copy_from_slice(buf);
+            Ok(())
+        }
 
-    /// A v5 superblock: 4 KiB blocks, 512-byte sectors, one AG.
+        fn is_writable(&self) -> bool {
+            true
+        }
+    }
+
+    /// A parseable v5 superblock: 4 KiB blocks, 512-byte sectors and
+    /// inodes, 4 AGs of 1000 blocks.
+    ///
+    /// A local copy of the builder in `dir.rs`'s tests, which follows the
+    /// choice already made in `bmbt.rs`: two fixture builders that can
+    /// diverge are better than one that silently changes another module's
+    /// ground. It is also the reason this test exists — an incomplete one
+    /// parses to a `Superblock` only if its own CRC is stamped, and the
+    /// first version of this helper skipped the geometry logs and the
+    /// checksum and died in `parse`.
     fn sb_v5() -> Superblock {
         let mut b = vec![0u8; 512];
         b[0..4].copy_from_slice(&crate::superblock::XFS_SB_MAGIC.to_be_bytes());
-        b[4..8].copy_from_slice(&4096u32.to_be_bytes());
+        b[4..8].copy_from_slice(&4096u32.to_be_bytes()); // blocksize
         b[8..16].copy_from_slice(&4000u64.to_be_bytes()); // dblocks
-        b[84..88].copy_from_slice(&1024u32.to_be_bytes()); // agblocks
-        b[88..92].copy_from_slice(&1u32.to_be_bytes()); // agcount
-        b[100..102].copy_from_slice(&5u16.to_be_bytes()); // v5
+        b[48..56].copy_from_slice(&100u64.to_be_bytes()); // logstart
+        b[56..64].copy_from_slice(&128u64.to_be_bytes()); // rootino
+        b[84..88].copy_from_slice(&1000u32.to_be_bytes()); // agblocks
+        b[88..92].copy_from_slice(&4u32.to_be_bytes()); // agcount
+        b[100..102]
+            .copy_from_slice(&(5u16 | crate::superblock::version_flags::MOREBITSBIT).to_be_bytes());
         b[102..104].copy_from_slice(&512u16.to_be_bytes()); // sectsize
         b[104..106].copy_from_slice(&512u16.to_be_bytes()); // inodesize
+        b[106..108].copy_from_slice(&8u16.to_be_bytes()); // inopblock
+        b[120] = 12; // blocklog
+        b[121] = 9; // sectlog
+        b[122] = 9; // inodelog
+        b[123] = 3; // inopblog
         b[124] = 10; // agblklog
+        b[192] = 0; // dirblklog: directory blocks are one fs block
+        for (i, slot) in b[32..48].iter_mut().enumerate() {
+            *slot = i as u8; // distinctive UUID
+        }
+        let crc = crc32c_with_zeroed_crc(&b, 224);
+        b[224..228].copy_from_slice(&crc.to_le_bytes());
         Superblock::parse(&b).expect("a parseable v5 superblock")
     }
 
@@ -409,16 +455,21 @@ mod tests {
         let sb = sb_v5();
         let dev = device_with(&agf_block(&sb));
         let payload = vec![0xC3u8; BLF_CHUNK];
-        let ops = buf_item(0, 1, payload.clone());
+        // Chunk 3 (bytes 384..512) rather than a low one: the AGF's own
+        // checksum sits at 216, inside chunk 1, and the restamp rewrites
+        // those four bytes — which is the right order for a replayer
+        // (patch, then stamp) and the wrong place to look for the patch.
+        let ops = buf_item(0, 3, payload.clone());
 
         let runs = apply_buf_items(&dev, &sb, &ops).expect("apply one buffer item");
         assert_eq!(runs, 1);
 
         let mut after = vec![0u8; 4096];
         dev.read_at(0, &mut after).unwrap();
+        let run = 3 * BLF_CHUNK;
         assert!(
-            after[BLF_CHUNK..2 * BLF_CHUNK].iter().all(|&x| x == 0xC3),
-            "chunk 1 of the block should hold the logged bytes"
+            after[run..run + BLF_CHUNK].iter().all(|&x| x == 0xC3),
+            "chunk 3 of the block should hold the logged bytes"
         );
         assert_eq!(
             after[BLF_CHUNK / 2],
